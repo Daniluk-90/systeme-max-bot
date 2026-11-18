@@ -38,7 +38,13 @@ def load_env(path):
             os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
 
-load_env(os.path.join(BASE_DIR, ".env"))
+import sys
+
+for _p in (os.path.join(BASE_DIR, ".env"), os.path.join(BASE_DIR, "env.txt"), ".env", "env.txt"):
+    load_env(_p)
+# Токен можно передать аргументом: python3 bot.py ТОКЕН
+if len(sys.argv) > 1 and sys.argv[1].strip():
+    os.environ["MAX_BOT_TOKEN"] = sys.argv[1].strip()
 
 MAX_TOKEN = os.environ.get("MAX_BOT_TOKEN", "")
 SYSTEME_TOKEN = os.environ.get("SYSTEME_TOKEN", "")
