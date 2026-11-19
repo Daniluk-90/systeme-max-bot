@@ -195,7 +195,8 @@ def format_answer(ref, info, stock):
                 p += f" (мин. партия {info['min_qty']} шт.)"
             lines.append(p)
     if not stock and not info:
-        return f"❓ Артикул **{ref}** не найден. Проверьте написание."
+        return (f"❓ Артикул **{ref}** не найден. Проверьте написание.\n"
+                f"Если это оборудование другого бренда, подберу замену: `аналог {ref}`")
     if not stock:
         lines.append("Остатков на складах нет (или данные не передаются — уточните у менеджера).")
     else:
@@ -222,6 +223,115 @@ def format_answer(ref, info, stock):
 
 def unit(u):
     return {"PCE": "шт.", "M": "м", "MTR": "м", "KGM": "кг"}.get((u or "").upper(), u or "")
+
+
+# ---------- Подбор аналогов (analogs.tools.systeme.ru) ----------
+
+ANALOGS_API = "https://analogs.tools.systeme.ru/api"
+_analog_cache = {}
+
+
+def analogs_api(method, body):
+    """POST JSON в API подбора аналогов. Один повтор при обрыве соединения."""
+    url = f"{ANALOGS_API}/{method}"
+    for attempt in (1, 2):
+        try:
+            raw = http("POST", url, headers={"User-Agent": "Mozilla/5.0", "Accept": "application/json"},
+                       body=body, timeout=30)
+            return json.loads(raw or b"{}")
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return {"status": "error", "http_code": 404}
+            if attempt == 2:
+                raise
+        except (urllib.error.URLError, ConnectionError, TimeoutError):
+            if attempt == 2:
+                raise
+        time.sleep(1.5)
+
+
+def stock_short(ref):
+    """Короткая строка об остатках аналога: «✅ 120 шт. на складах» / «нет на складах»."""
+    stock = None
+    for attempt in (1, 2):
+        try:
+            stock = get_stock(ref) if SYSTEME_TOKEN else web_stock(ref)[1]
+            break
+        except Exception as e:
+            log.warning("stock_short %s (попытка %s): %s", ref, attempt, e)
+            time.sleep(1.5)
+    if stock is None:
+        return ""
+    total = 0
+    for s in stock:
+        try:
+            total += int(float(s.get("count", "0") or 0))
+        except ValueError:
+            pass
+    return f"✅ на складах: **{total}** шт." if total > 0 else "🕓 на складах нет"
+
+
+def find_analog(ref):
+    now = time.time()
+    key = ref.upper()
+    hit = _analog_cache.get(key)
+    if hit and now - hit[0] < CACHE_TTL:
+        return hit[1]
+
+    res = analogs_api("search_analog", {"reference": ref})
+    options = ((res.get("data") or {}).get("analogs")) or []
+
+    if not options:
+        # Возможно, артикул неполный — предложим варианты из поиска
+        sr = analogs_api("search", {"query": ref})
+        found = ((sr.get("data") or {}).get("results")) or []
+        refs = [x["name"] for x in found if x.get("category") == "ref"]
+        refs += [x["ref"] for x in found if x.get("category") == "desc" and x.get("ref")]
+        refs = [r for r in dict.fromkeys(refs) if r.upper() != key][:10]
+        if refs:
+            answer = (f"🔎 Точного артикула **{ref}** нет в базе аналогов. Возможно, вы имели в виду:\n"
+                      + "\n".join(f"• `{r}`" for r in refs)
+                      + "\n\nПришлите: `аналог ПОЛНЫЙ_АРТИКУЛ`")
+        else:
+            answer = (f"❓ Для **{ref}** аналог не найден.\n"
+                      "Проверьте артикул или подберите вручную: https://analogs.tools.systeme.ru")
+        _analog_cache[key] = (now, answer)
+        return answer
+
+    lines = [f"🔁 Аналог для **{ref.upper()}**"]
+    try:
+        info = analogs_api("reference_info", {"reference": ref})
+        d = info.get("data") or {}
+        orig = " · ".join(x for x in (d.get("vendor"), d.get("description"), d.get("product_line")) if x)
+        if orig:
+            lines.append(f"_Исходный: {orig}_")
+    except Exception as e:
+        log.warning("reference_info %s: %s", ref, e)
+
+    for n, option in enumerate(options[:3], 1):
+        lines.append("")
+        if len(options) > 1:
+            lines.append(f"**Вариант {n}:**")
+        if len(option) > 1:
+            lines.append("_Комплект из нескольких позиций:_")
+        for a in option:
+            r = a.get("reference", "")
+            qty = a.get("quantity") or 1
+            head = f"➡️ **{r}**" + (f" × {qty}" if qty and qty != 1 else "")
+            lines.append(head)
+            if a.get("description"):
+                lines.append(a["description"])
+            if a.get("product_line"):
+                lines.append(f"Серия: {a['product_line']}")
+            if a.get("comment"):
+                lines.append(f"💬 {a['comment']}")
+            st = stock_short(r)
+            if st:
+                lines.append(st)
+    lines.append("\n_Подбор ориентировочный, перед заказом сверьте характеристики._")
+    answer = "\n".join(lines)
+    _analog_cache[key] = (now, answer)
+    return answer
 
 
 # ---------- MAX Bot API ----------
@@ -260,9 +370,13 @@ HELP = (
     "(Лобня, Екатеринбург).\n\n"
     "Пришлите артикул, например: `ZENL1121`\n"
     "Можно несколько через пробел или запятую: `A9C62225, 11001DEK`\n\n"
+    "🔁 **Подбор аналога** Systeme Electric для оборудования других брендов "
+    "(Schneider, ABB, Siemens, IEK, EKF и др.) — напишите слово «аналог» и артикул:\n"
+    "`аналог LC1D09M7`\n\n"
     "Остатки обновляются 4 раза в день (8:00, 12:00, 16:00, 22:00 МСК)."
 )
 
+ANALOG_RE = re.compile(r"^\s*(?:/analog|/аналог|аналоги?|замена|подбор)\b[\s:,-]*(.*)$", re.I | re.S)
 REF_RE = re.compile(r"[A-Za-zА-Яа-я0-9][A-Za-zА-Яа-я0-9._/\-]{2,39}")
 
 
@@ -270,6 +384,19 @@ def handle_text(text):
     t = text.strip()
     if t.lower() in ("/start", "/help", "start", "помощь", "старт"):
         return HELP
+    m = ANALOG_RE.match(t)
+    if m:
+        refs = [r for r in dict.fromkeys(REF_RE.findall(m.group(1))) if any(c.isdigit() for c in r)][:5]
+        if not refs:
+            return "Напишите артикул после слова «аналог», например: `аналог LC1D09M7`"
+        out = []
+        for ref in refs:
+            try:
+                out.append(find_analog(ref))
+            except Exception as e:
+                log.exception("analog %s", ref)
+                out.append(f"⚠️ {ref}: сервис подбора аналогов не ответил ({type(e).__name__}). Попробуйте позже.")
+        return "\n\n———\n\n".join(out)
     refs = list(dict.fromkeys(REF_RE.findall(t)))[:MAX_REFS]
     refs = [r for r in refs if any(c.isdigit() for c in r)]  # артикул почти всегда с цифрами
     if not refs:
