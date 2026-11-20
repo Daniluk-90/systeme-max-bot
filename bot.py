@@ -159,7 +159,12 @@ def check(ref):
     if hit and now - hit[0] < CACHE_TTL:
         return hit[1]
     if not SYSTEME_TOKEN:
-        info, stock = web_stock(ref)
+        try:
+            info, stock = web_stock(ref)
+        except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
+            log.warning("web_stock %s: %s — повтор", ref, e)
+            time.sleep(1.5)
+            info, stock = web_stock(ref)
         answer = format_answer(ref, info, stock)
         _cache[ref.upper()] = (now, answer)
         return answer
@@ -334,6 +339,93 @@ def find_analog(ref):
     return answer
 
 
+# ---------- Статистика пользователей ----------
+
+DATA_DIR = os.environ.get("DATA_DIR", BASE_DIR)
+USERS_FILE = os.path.join(DATA_DIR, "users.json")
+VISITS_FILE = os.path.join(DATA_DIR, "visits.csv")
+ADMIN_IDS = {x.strip() for x in os.environ.get("ADMIN_IDS", "").replace(";", ",").split(",") if x.strip()}
+MSK = 3 * 3600
+
+
+def now_msk():
+    return time.strftime("%d.%m.%Y %H:%M", time.gmtime(time.time() + MSK))
+
+
+def load_users():
+    try:
+        with open(USERS_FILE, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def user_name(sender):
+    name = sender.get("name") or " ".join(
+        x for x in (sender.get("first_name"), sender.get("last_name")) if x)
+    return (name or "").strip() or "без имени"
+
+
+def record(sender, text):
+    """Запоминаем пользователя и его запрос (users.json + visits.csv для Excel)."""
+    uid = str(sender.get("user_id") or "")
+    if not uid:
+        return
+    try:
+        users = load_users()
+        u = users.get(uid) or {"first": now_msk(), "count": 0}
+        u["name"] = user_name(sender)
+        u["username"] = sender.get("username") or u.get("username") or ""
+        u["count"] = u.get("count", 0) + 1
+        u["last"] = now_msk()
+        u["last_query"] = text[:100]
+        users[uid] = u
+        tmp = USERS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(users, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, USERS_FILE)
+
+        new_file = not os.path.exists(VISITS_FILE)
+        with open(VISITS_FILE, "a", encoding="utf-8-sig" if new_file else "utf-8", newline="") as f:
+            if new_file:
+                f.write("Время (МСК);ID;Имя;Username;Запрос\r\n")
+            q = text[:200].replace(";", ",").replace("\r", " ").replace("\n", " ")
+            f.write(f"{u['last']};{uid};{u['name'].replace(';', ',')};{u['username']};{q}\r\n")
+    except Exception:
+        log.exception("record")
+
+
+def stats_text(uid):
+    uid = str(uid or "")
+    if not ADMIN_IDS:
+        return ("🔐 Администратор бота ещё не назначен.\n\n"
+                f"Ваш ID в MAX: `{uid}`\n\n"
+                "Чтобы статистика открывалась только вам, выполните на роутере (по ssh):\n"
+                f"`echo ADMIN_IDS={uid} >> /root/max-bot/.env && /etc/init.d/maxbot restart`\n\n"
+                "После этого снова пришлите /stats.")
+    if uid not in ADMIN_IDS:
+        return "Не понимаю команду 🤔\n\n" + HELP
+    users = load_users()
+    if not users:
+        return "📊 Пока боту никто не писал."
+    def key(item):
+        try:
+            return time.mktime(time.strptime(item[1].get("last", ""), "%d.%m.%Y %H:%M"))
+        except ValueError:
+            return 0
+    rows = sorted(users.items(), key=key, reverse=True)
+    total = sum(u.get("count", 0) for u in users.values())
+    lines = [f"📊 **Пользователи бота: {len(users)}**, запросов всего: {total}\n"]
+    for i, (k, u) in enumerate(rows[:40], 1):
+        nick = f" @{u['username']}" if u.get("username") else ""
+        lines.append(f"{i}. **{u.get('name', '')}**{nick} (id {k})\n"
+                     f"   запросов: {u.get('count', 0)}, последний: {u.get('last', '')} — «{u.get('last_query', '')}»")
+    if len(rows) > 40:
+        lines.append(f"\n…и ещё {len(rows) - 40}")
+    lines.append("\n_Полная история запросов — файл visits.csv в папке бота (открывается в Excel)._")
+    return "\n".join(lines)
+
+
 # ---------- MAX Bot API ----------
 
 def max_api(method, path, params=None, body=None, timeout=40):
@@ -423,8 +515,15 @@ def process(update):
         rcp = msg.get("recipient") or {}
         if sender.get("is_bot") or not text:
             return
-        log.info("from %s: %s", sender.get("user_id"), text[:100])
-        reply = handle_text(text)
+        log.info("from %s (%s): %s", sender.get("user_id"), user_name(sender), text[:100])
+        cmd = text.strip().lower()
+        if cmd in ("/stats", "/статистика", "статистика"):
+            reply = stats_text(sender.get("user_id"))
+        elif cmd in ("/myid", "/id"):
+            reply = f"Ваш ID в MAX: `{sender.get('user_id')}`"
+        else:
+            record(sender, text)
+            reply = handle_text(text)
         if rcp.get("chat_type") == "dialog":
             send(reply, user_id=sender.get("user_id"))
         else:
